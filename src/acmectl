@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+prog="$(basename "$0")"
+usage() {
+  cat <<EOF
+Usage:
+  $prog list <acme.json>
+  $prog remove <acme.json> [--domains d1 d2 ...] [--dry-run]
+  --domains enables non-interactive deletion (exact match to "main" domain)
+  --dry-run shows changes without writing
+EOF
+  exit 2
+}
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || { echo "jq required. Install it and retry." >&2; exit 1; }
+}
+
+# Colors (only if stdout is a TTY)
+if [ -t 1 ]; then
+  RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; BOLD=''; RESET=''
+fi
+
+timestamp() { date +%Y%m%d-%H%M%S; }
+
+# list domain entries as "resolver:domain"
+list_domains() {
+  local file="$1"
+  jq -r 'to_entries[] | .key as $resolver | .value.Certificates? // [] | .[] | "\($resolver):\(.domain.main)"' "$file"
+}
+
+backup_file() {
+  local file="$1"
+  local dir
+  dir="$(dirname -- "$file")"
+  local base
+  base="$(basename -- "$file")"
+  local bak="$dir/bak.$(timestamp).$base"
+  cp -- "$file" "$bak"
+  echo "$bak"
+}
+remove_domains() {
+  local file="$1"; shift
+  local -a targets=("$@")
+  local dry_run=0
+  if [ "${targets[0]:-}" = "--dry-run" ]; then
+    dry_run=1
+    targets=("${targets[@]:1}")
+  fi
+
+  if [ "${#targets[@]}" -eq 0 ]; then
+    echo "${RED}${BOLD}Error:${RESET} No target domains provided for non-interactive removal." >&2
+    return 1
+  fi
+
+  local jq_targets
+  jq_targets="$(printf '%s\n' "${targets[@]}" | jq -R . | jq -s .)"
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/acme.XXXXXX.json")"
+  trap 'rm -f "$tmp"' EXIT
+
+  jq --argjson targets "$jq_targets" '
+    to_entries
+    | map(
+        .value.Certificates? as $certs
+        | if ($certs == null) then . else
+            .value.Certificates = ($certs | map(select((.domain.main // "") as $d | ($targets | index($d)) | not)))
+            | .
+        end
+      )
+    | from_entries
+  ' "$file" >"$tmp"
+
+  local before after
+  before="$(list_domains "$file" | sort)"
+  after="$(jq -r 'to_entries[] | .key as $resolver | .value.Certificates? // [] | .[] | "\($resolver):\(.domain.main)"' "$tmp" | sort)"
+
+  local removed
+  removed="$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after") || true)"
+
+  if [ -z "$removed" ]; then
+    echo "${YELLOW}${BOLD}Notice:${RESET} No matching domains found to remove."
+    trap - EXIT
+    return 0
+  fi
+
+  echo "${BLUE}${BOLD}Will remove the following entries:${RESET}"
+  printf '%s\n' "$removed" | sed "s/^/${YELLOW}- /; s/:/:${GREEN}/; s/$/${RESET}/"
+
+  if [ "$dry_run" -eq 1 ]; then
+    echo "${BLUE}(dry-run)${RESET} no file written"
+    trap - EXIT
+    return 0
+  fi
+
+  local bak
+  bak="$(backup_file "$file")"
+  mv -- "$tmp" "$file"
+  trap - EXIT
+  echo "${GREEN}${BOLD}Updated file written.${RESET} Backup: ${BOLD}$bak${RESET}"
+}
+
+interactive_remove() {
+  local file="$1"
+  mapfile -t entries < <(list_domains "$file")
+  if [ "${#entries[@]}" -eq 0 ]; then
+    echo "${YELLOW}No certificates found in ${file}${RESET}"
+    return 0
+  fi
+
+  echo "${BLUE}${BOLD}Found the following certificate entries:${RESET}"
+  local i=1
+  for e in "${entries[@]}"; do
+    resolver="${e%%:*}"
+    domain="${e#*:}"
+    printf " %3d) ${BOLD}%s${RESET}:${GREEN}%s${RESET}\n" "$i" "$resolver" "$domain"
+    i=$((i+1))
+  done
+
+  echo
+  echo -n "${BOLD}Enter numbers to delete${RESET} (comma-separated, ranges allowed, e.g. 1,3-5), or '${BOLD}q${RESET}' to cancel: "
+  read -r sel
+  [ -z "$sel" ] && { echo "${YELLOW}Cancelled.${RESET}"; return 1; }
+  case "$sel" in
+    q|Q) echo "${YELLOW}Cancelled.${RESET}"; return 1 ;;
+  esac
+
+  IFS=',' read -r -a parts <<<"$sel"
+  declare -a to_delete
+  for p in "${parts[@]}"; do
+    if [[ "$p" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      start=${BASH_REMATCH[1]}; end=${BASH_REMATCH[2]}
+      for ((k=start;k<=end;k++)); do
+        idx=$((k-1))
+        [ "$idx" -ge 0 ] && [ "$idx" -lt "${#entries[@]}" ] && to_delete+=("${entries[$idx]##*:}")
+      done
+    elif [[ "$p" =~ ^[0-9]+$ ]]; then
+      k=$p; idx=$((k-1))
+      [ "$idx" -ge 0 ] && [ "$idx" -lt "${#entries[@]}" ] && to_delete+=("${entries[$idx]##*:}")
+    else
+      echo "${YELLOW}Ignoring invalid token:${RESET} $p"
+    fi
+  done
+
+  if [ "${#to_delete[@]}" -eq 0 ]; then
+    echo "${YELLOW}No valid selections.${RESET}"
+    return 1
+  fi
+
+  echo "${BLUE}${BOLD}Selected for deletion:${RESET}"
+  for d in "${to_delete[@]}"; do
+    echo "  ${RED}- ${d}${RESET}"
+  done
+
+  echo -n "${BOLD}Proceed? (y/N): ${RESET}"
+  read -r ok
+  case "$ok" in
+    y|Y) remove_domains "$file" "${to_delete[@]}" ;;
+    *) echo "${YELLOW}Cancelled.${RESET}" ; return 1 ;;
+  esac
+}
+
+main() {
+  require_jq
+  [ $# -ge 2 ] || usage
+  cmd="$1"; shift
+  file="$1"; shift
+
+  case "$cmd" in
+    list)
+      echo "${BLUE}${BOLD}Certificates in ${file}:${RESET}"
+      list_domains "$file" | while IFS= read -r line; do
+        resolver="${line%%:*}"; domain="${line#*:}"
+        printf "  ${GREEN}- ${BOLD}%s${RESET}:${BLUE}%s${RESET}\n" "$resolver" "$domain"
+      done
+      ;;
+    remove)
+      if [ "$#" -gt 0 ]; then
+        if [ "$1" = "--domains" ]; then
+          shift
+          domains=()
+          while [ "$#" -gt 0 ]; do
+            if [ "$1" = "--dry-run" ]; then
+              dry=1; shift; break
+            fi
+            domains+=("$1"); shift
+          done
+          if [ "${#domains[@]}" -eq 0 ]; then
+            echo "${RED}No domains supplied after --domains${RESET}" >&2; exit 2
+          fi
+          if [ "${dry:-0}" = 1 ]; then
+            remove_domains "$file" --dry-run "${domains[@]}"
+          else
+            remove_domains "$file" "${domains[@]}"
+          fi
+        elif [ "$1" = "--dry-run" ]; then
+          echo "${RED}--dry-run requires --domains in non-interactive mode.${RESET}" >&2; exit 2
+        else
+          usage
+        fi
+      else
+        interactive_remove "$file"
+      fi
+      ;;
+    *)
+      usage
+      ;;
+  esac
+}
+
+main "$@"
