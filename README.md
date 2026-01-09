@@ -21,3 +21,17 @@ curl -fsSL https://raw.githubusercontent.com/XavierDupuis/acmectl/main/install.s
 curl -LO https://github.com/XavierDupuis/acmectl/raw/main/src/acmectl
 sudo install -m 0755 acmectl /usr/local/bin/acmectl
 ```
+
+## Testing
+```bash
+chmod +x tests/*.sh tests/suites/suite*.sh
+```
+### Run all tests
+```bash
+./tests/run.sh
+```
+
+### Run a specific suite
+```bash
+./tests/suites/suite-***.sh
+```
