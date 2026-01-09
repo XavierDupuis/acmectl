@@ -42,6 +42,7 @@ backup_file() {
   cp -- "$file" "$bak"
   echo "$bak"
 }
+
 remove_domains() {
   local file="$1"; shift
   local -a targets=("$@")
